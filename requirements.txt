@@ -1,11 +1,12 @@
 requests
-urllib3
 flask
 psutil
 PyJWT
 pytz
 aiohttp
+urllib3
 protobuf
 protobuf-decoder
-pycryptodome
+google-play-scraper
 cfonts
+pycryptodome
