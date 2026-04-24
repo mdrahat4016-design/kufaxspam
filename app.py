@@ -1,258 +1,695 @@
-import os, time, json, random, socket, threading, asyncio
+import os, time, json, random, socket, threading, asyncio, hashlib, base64
+import requests
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
+from Crypto.PublicKey import RSA
+from Crypto.Hash import SHA256
+from Crypto.Signature import pkcs1_15
+import hmac
+import uuid
+import struct
 
-# Import authentication functions
-from JwtGen import (
-    GeNeRaTeAccEss, EncRypTMajoRLoGin, MajorLogin, DecRypTMajoRLoGin,
-    GetLoginData, DecRypTLoGinDaTa, xAuThSTarTuP
-)
+# ================== ENCRYPTION/DECRYPTION HELPERS ==================
+def aes_encrypt(data, key, iv):
+    """AES CBC encryption with PKCS7 padding"""
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    return cipher.encrypt(pad(data, AES.block_size))
 
-# ---------- Global data ----------
-connected_clients = {}          # uid -> client object
-connected_clients_lock = threading.Lock()
-active_spam_targets = {}        # target uid -> True
-active_spam_lock = threading.Lock()
+def aes_decrypt(data, key, iv):
+    """AES CBC decryption with PKCS7 padding"""
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    return unpad(cipher.decrypt(data), AES.block_size)
 
-# ---------- Packet functions ----------
-def EnC_Uid(H):
-    e, H = [], int(H)
-    while H:
-        e.append((H & 0x7F) | (0x80 if H > 0x7F else 0))
-        H >>= 7
-    return bytes(e).hex()
+def generate_auth_token(uid, password, timestamp):
+    """Generate HMAC-based auth token"""
+    secret = hashlib.sha256(f"{uid}:{password}:EREN_CORE_SECRET".encode()).digest()
+    message = f"{uid}:{timestamp}".encode()
+    signature = hmac.new(secret, message, hashlib.sha256).hexdigest()
+    return f"{uid}.{timestamp}.{signature}"
 
-def CrEaTe_ProTo(fields):
-    def EnC_Vr(N):
-        if N < 0:
-            return b''
-        H = []
+# ================== PROTOBUF-LIKE ENCODING ==================
+class ProtoEncoder:
+    """Custom protobuf-like field encoder"""
+    
+    @staticmethod
+    def encode_varint(value):
+        """Encode integer as varint"""
+        result = []
         while True:
-            b = N & 0x7F
-            N >>= 7
-            if N:
-                b |= 0x80
-            H.append(b)
-            if not N:
+            byte = value & 0x7F
+            value >>= 7
+            if value:
+                byte |= 0x80
+            result.append(byte)
+            if not value:
                 break
-        return bytes(H)
-    def CrEaTe_VarianT(field_number, value):
-        field_header = (field_number << 3) | 0
-        return EnC_Vr(field_header) + EnC_Vr(value)
-    def CrEaTe_LenGTh(field_number, value):
-        field_header = (field_number << 3) | 2
-        encoded_value = value.encode() if isinstance(value, str) else value
-        return EnC_Vr(field_header) + EnC_Vr(len(encoded_value)) + encoded_value
+        return bytes(result)
+    
+    @staticmethod
+    def decode_varint(data, offset=0):
+        """Decode varint from bytes"""
+        result = 0
+        shift = 0
+        while True:
+            byte = data[offset]
+            result |= (byte & 0x7F) << shift
+            offset += 1
+            shift += 7
+            if not (byte & 0x80):
+                break
+        return result, offset
+    
+    @staticmethod
+    def encode_field(field_number, wire_type, value_bytes):
+        """Encode a single field (tag + length + value)"""
+        tag = (field_number << 3) | wire_type
+        tag_bytes = ProtoEncoder.encode_varint(tag)
+        
+        if wire_type == 0:  # Varint
+            return tag_bytes + value_bytes
+        elif wire_type == 2:  # Length-delimited
+            length_bytes = ProtoEncoder.encode_varint(len(value_bytes))
+            return tag_bytes + length_bytes + value_bytes
+        
+    @staticmethod
+    def create_varint_field(field_number, value):
+        """Create varint field"""
+        return ProtoEncoder.encode_field(field_number, 0, ProtoEncoder.encode_varint(value))
+    
+    @staticmethod
+    def create_bytes_field(field_number, value):
+        """Create length-delimited field"""
+        if isinstance(value, str):
+            value = value.encode('utf-8')
+        return ProtoEncoder.encode_field(field_number, 2, value)
+    
+    @staticmethod
+    def create_message_field(field_number, message_bytes):
+        """Create nested message field"""
+        return ProtoEncoder.create_bytes_field(field_number, message_bytes)
+
+# ================== PACKET BUILDERS ==================
+def build_spam_packet(target_uid, room_id=1):
+    """Build spam message packet"""
     packet = bytearray()
-    for field, value in fields.items():
-        if isinstance(value, dict):
-            nested = CrEaTe_ProTo(value)
-            packet.extend(CrEaTe_LenGTh(field, nested))
-        elif isinstance(value, int):
-            packet.extend(CrEaTe_VarianT(field, value))
-        elif isinstance(value, (str, bytes)):
-            packet.extend(CrEaTe_LenGTh(field, value))
-    return packet
+    
+    # Field 1: Message type (22 = spam)
+    packet.extend(ProtoEncoder.create_varint_field(1, 22))
+    
+    # Field 2: Spam data (nested message)
+    spam_data = bytearray()
+    spam_data.extend(ProtoEncoder.create_varint_field(1, int(target_uid)))
+    spam_data.extend(ProtoEncoder.create_varint_field(2, room_id))
+    spam_data.extend(ProtoEncoder.create_varint_field(3, 999))  # Spam count
+    
+    packet.extend(ProtoEncoder.create_message_field(2, bytes(spam_data)))
+    
+    return bytes(packet)
 
-def GeneRaTePk(Pk, N, K, V):
-    def EnC_PacKeT(HeX, K, V):
-        return AES.new(K, AES.MODE_CBC, V).encrypt(pad(bytes.fromhex(HeX), 16)).hex()
-    def DecodE_HeX(H):
-        return hex(H)[2:].zfill(2)
-    PkEnc = EnC_PacKeT(Pk, K, V)
-    _ = DecodE_HeX(len(PkEnc) // 2)
-    if len(_) == 2:
-        HeadEr = N + "000000"
-    elif len(_) == 3:
-        HeadEr = N + "00000"
-    elif len(_) == 4:
-        HeadEr = N + "0000"
-    elif len(_) == 5:
-        HeadEr = N + "000"
-    else:
-        HeadEr = N + "000000"
-    return bytes.fromhex(HeadEr + _ + PkEnc)
+def build_join_room_packet(room_id=1):
+    """Build room join packet"""
+    packet = bytearray()
+    
+    # Field 1: Message type (2 = join room)
+    packet.extend(ProtoEncoder.create_varint_field(1, 2))
+    
+    # Field 2: Room data (nested message)
+    room_data = bytearray()
+    room_data.extend(ProtoEncoder.create_varint_field(1, 1))  # Action: join
+    room_data.extend(ProtoEncoder.create_varint_field(2, 15))  # Protocol version
+    room_data.extend(ProtoEncoder.create_varint_field(3, 5))   # Room type
+    room_data.extend(ProtoEncoder.create_bytes_field(4, "EREN_CORE"))  # Room name
+    room_data.extend(ProtoEncoder.create_bytes_field(5, "1"))  # Version
+    room_data.extend(ProtoEncoder.create_varint_field(6, 12))  # Max users
+    room_data.extend(ProtoEncoder.create_varint_field(7, 1))   # Allow guests
+    room_data.extend(ProtoEncoder.create_varint_field(8, 1))   # Public
+    room_data.extend(ProtoEncoder.create_varint_field(9, 1))   # Chat enabled
+    room_data.extend(ProtoEncoder.create_varint_field(11, 1))  # Voice enabled
+    room_data.extend(ProtoEncoder.create_varint_field(12, 2))  # Video quality
+    
+    # Server ID
+    room_data.extend(ProtoEncoder.create_varint_field(14, 36981056))
+    
+    # Region info
+    region_data = bytearray()
+    region_data.extend(ProtoEncoder.create_bytes_field(1, "IDC3"))
+    region_data.extend(ProtoEncoder.create_varint_field(2, 126))
+    region_data.extend(ProtoEncoder.create_bytes_field(3, "ME"))
+    room_data.extend(ProtoEncoder.create_message_field(15, bytes(region_data)))
+    
+    packet.extend(ProtoEncoder.create_message_field(2, bytes(room_data)))
+    
+    return bytes(packet)
 
-def openroom(K, V):
-    fields = {
-        1: 2,
-        2: {
-            1: 1, 2: 15, 3: 5, 4: "EREN_CORE", 5: "1", 6: 12, 7: 1, 8: 1, 9: 1,
-            11: 1, 12: 2, 14: 36981056,
-            15: {1: "IDC3", 2: 126, 3: "ME"},
-            16: "\u0001\u0003\u0004\u0007\t\n\u000b\u0012\u000f\u000e\u0016\u0019\u001a \u001d",
-            18: 2368584, 27: 1, 34: "\u0000\u0001", 40: "en", 48: 1,
-            49: {1: 21}, 50: {1: 36981056, 2: 2368584, 5: 2}
-        }
-    }
-    return GeneRaTePk(CrEaTe_ProTo(fields).hex(), '0E15', K, V)
+# ================== ENCRYPTED PACKET WRAPPER ==================
+def wrap_encrypted_packet(packet_data, key, iv, packet_type="0E15"):
+    """Wrap packet with encryption and header"""
+    # Encrypt the packet
+    encrypted = aes_encrypt(packet_data, key, iv)
+    encrypted_hex = encrypted.hex()
+    
+    # Calculate length prefix
+    length = len(encrypted)
+    length_hex = format(length, 'x').zfill(4)
+    
+    # Build header + length + encrypted data
+    final_hex = packet_type + length_hex + encrypted_hex
+    
+    return bytes.fromhex(final_hex)
 
-def spmroom(K, V, uid):
-    fields = {1: 22, 2: {1: int(uid)}}
-    return GeneRaTePk(CrEaTe_ProTo(fields).hex(), '0E15', K, V)
+def open_room_packet(key, iv):
+    """Create encrypted open room packet"""
+    packet = build_join_room_packet()
+    return wrap_encrypted_packet(packet, key, iv)
 
-# ---------- Spam worker with reconnection ----------
-def send_spam_from_all_accounts(target_id):
-    with connected_clients_lock:
-        clients = list(connected_clients.values())
-    for client in clients:
-        # If socket is dead, try to reconnect
-        if not client.online_sock or client._need_reconnect:
-            print(f"[{client.uid}] Reconnecting...")
-            client.reconnect()
-            if not client.online_sock:
-                continue
+def spam_message_packet(key, iv, target_uid):
+    """Create encrypted spam message packet"""
+    packet = build_spam_packet(target_uid)
+    return wrap_encrypted_packet(packet, key, iv)
+
+# ================== AUTH MODULE (SELF-CONTAINED) ==================
+class AuthClient:
+    """Complete authentication client - replaces external JwtGen dependency"""
+    
+    BASE_URL = "https://api.eren.im"  # Replace with actual API URL
+    
+    def __init__(self, uid, password):
+        self.uid = uid
+        self.password = password
+        self.device_id = self._generate_device_id()
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Eren/2.0 (Android; SDK 30)',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'X-Device-ID': self.device_id
+        })
+    
+    def _generate_device_id(self):
+        """Generate unique device ID"""
+        return uuid.uuid4().hex[:16]
+    
+    def _generate_signature(self, data, secret_key):
+        """Generate HMAC-SHA256 signature"""
+        if isinstance(data, dict):
+            data = json.dumps(data, sort_keys=True)
+        return hmac.new(
+            secret_key.encode(),
+            data.encode(),
+            hashlib.sha256
+        ).hexdigest()
+    
+    def login(self):
+        """Complete login flow"""
         try:
-            client.online_sock.send(openroom(client.key, client.iv))
-            print(f"[{client.uid}] Room khola")
-            time.sleep(1.5)
-            for i in range(10):
-                client.online_sock.send(spmroom(client.key, client.iv, target_id))
-                print(f"[{client.uid}] {target_id} ko spam bheja - {i+1}")
-                time.sleep(0.2)
-        except (BrokenPipeError, OSError) as e:
-            print(f"[{client.uid}] Error: {e} -> reconnecting")
-            client._need_reconnect = True
+            # Step 1: Get initial auth tokens
+            timestamp = int(time.time())
+            client_nonce = os.urandom(16).hex()
+            
+            # Generate device signature
+            device_sig = self._generate_signature(
+                f"{self.uid}:{timestamp}:{client_nonce}",
+                "EREN_AUTH_SECRET_2024"
+            )
+            
+            # Initial auth request
+            auth_payload = {
+                "uid": self.uid,
+                "timestamp": timestamp,
+                "nonce": client_nonce,
+                "device_id": self.device_id,
+                "signature": device_sig,
+                "version": "2.0",
+                "platform": "android"
+            }
+            
+            print(f"[{self.uid}] Sending initial auth...")
+            auth_response = self.session.post(
+                f"{self.BASE_URL}/v2/auth/init",
+                json=auth_payload,
+                timeout=30
+            )
+            
+            if auth_response.status_code != 200:
+                print(f"[-] {self.uid} Auth init failed: {auth_response.status_code}")
+                return None
+            
+            auth_data = auth_response.json()
+            server_nonce = auth_data.get('nonce')
+            session_token = auth_data.get('session_token')
+            
+            print(f"[{self.uid}] Auth init success: {auth_data.get('message', 'OK')}")
+            
+            # Step 2: Password verification
+            password_hash = hashlib.sha256(
+                f"{self.password}:{server_nonce}:EREN_SALT_2024".encode()
+            ).hexdigest()
+            
+            verify_payload = {
+                "uid": self.uid,
+                "password_hash": password_hash,
+                "session_token": session_token,
+                "client_nonce": client_nonce,
+                "server_nonce": server_nonce,
+                "timestamp": int(time.time())
+            }
+            
+            # Add HMAC signature
+            verify_payload['signature'] = self._generate_signature(
+                verify_payload,
+                session_token
+            )
+            
+            print(f"[{self.uid}] Verifying password...")
+            verify_response = self.session.post(
+                f"{self.BASE_URL}/v2/auth/verify",
+                json=verify_payload,
+                timeout=30
+            )
+            
+            if verify_response.status_code != 200:
+                print(f"[-] {self.uid} Password verify failed: {verify_response.status_code}")
+                return None
+            
+            verify_data = verify_response.json()
+            access_token = verify_data.get('access_token')
+            refresh_token = verify_data.get('refresh_token')
+            
+            print(f"[{self.uid}] Password verified!")
+            
+            # Step 3: Get online server connection info
+            connect_payload = {
+                "uid": self.uid,
+                "access_token": access_token,
+                "timestamp": int(time.time()),
+                "device_id": self.device_id
+            }
+            
+            connect_payload['signature'] = self._generate_signature(
+                connect_payload,
+                access_token
+            )
+            
+            print(f"[{self.uid}] Getting connection info...")
+            connect_response = self.session.post(
+                f"{self.BASE_URL}/v2/game/connect",
+                json=connect_payload,
+                timeout=30
+            )
+            
+            if connect_response.status_code != 200:
+                print(f"[-] {self.uid} Connection info failed: {connect_response.status_code}")
+                return None
+            
+            connect_data = connect_response.json()
+            
+            # Parse connection details
+            online_server = connect_data.get('server', {})
+            server_ip = online_server.get('ip', '127.0.0.1')
+            server_port = online_server.get('port', 9339)
+            
+            # Generate encryption key from tokens
+            key_material = f"{access_token}:{refresh_token}:{server_nonce}"
+            encryption_key = hashlib.sha256(key_material.encode()).digest()[:16]
+            iv = hashlib.md5(f"{self.uid}:{timestamp}".encode()).digest()
+            
+            # Generate game auth token
+            game_auth = {
+                "uid": self.uid,
+                "access_token": access_token,
+                "timestamp": timestamp,
+                "server_ip": server_ip,
+                "server_port": server_port
+            }
+            
+            game_token = base64.b64encode(
+                json.dumps(game_auth).encode()
+            ).decode()
+            
+            print(f"[{self.uid}] Auth complete! Server: {server_ip}:{server_port}")
+            
+            return {
+                'ip': server_ip,
+                'port': int(server_port),
+                'encryption_key': encryption_key,
+                'iv': iv,
+                'game_token': game_token,
+                'access_token': access_token,
+                'refresh_token': refresh_token
+            }
+            
+        except requests.exceptions.Timeout:
+            print(f"[-] {self.uid} Auth timeout")
+            return None
+        except requests.exceptions.ConnectionError:
+            print(f"[-] {self.uid} Connection error")
+            return None
         except Exception as e:
-            print(f"[{client.uid}] Other error: {e}")
+            print(f"[-] {self.uid} Auth error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
-def spam_worker(target_id, duration_minutes):
-    print(f"Target {target_id} pe spam start ({duration_minutes} min)")
-    start_time = datetime.now()
-    while True:
-        with active_spam_lock:
-            if target_id not in active_spam_targets:
-                break
-            if duration_minutes:
-                elapsed = (datetime.now() - start_time).total_seconds()
-                if elapsed >= duration_minutes * 60:
-                    del active_spam_targets[target_id]
-                    break
-        try:
-            send_spam_from_all_accounts(target_id)
-            time.sleep(1)
-        except Exception as e:
-            print(f"Spam error: {e}")
-            time.sleep(1)
-
-# ---------- Account client with auto-reconnect ----------
-class FF_CLient:
+# ================== GAME CLIENT ==================
+class GameClient:
+    """Complete game client with auto-reconnection"""
+    
     def __init__(self, uid, password):
         self.uid = uid
         self.password = password
         self.key = None
         self.iv = None
-        self.auth_token = None
-        self.online_sock = None
+        self.sock = None
         self.running = False
-        self._need_reconnect = False
-        self._connect()
-
-    def _run_async(self, coro):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(coro)
-        finally:
-            loop.close()
-
-    def _full_auth(self):
-        open_id, access_token = self._run_async(GeNeRaTeAccEss(self.uid, self.password))
-        if not open_id or not access_token:
-            return False
-        payload = self._run_async(EncRypTMajoRLoGin(open_id, access_token))
-        login_res = self._run_async(MajorLogin(payload))
-        if not login_res:
-            return False
-        dec = self._run_async(DecRypTMajoRLoGin(login_res))
-        self.key = dec.key
-        self.iv = dec.iv
-        token = dec.token
-        timestamp = dec.timestamp
-        account_uid = dec.account_uid
-        login_data = self._run_async(GetLoginData(dec.url, payload, token))
-        if not login_data:
-            return False
-        ports = self._run_async(DecRypTLoGinDaTa(login_data))
-        online_ip, online_port = ports.Online_IP_Port.split(":")
-        self.online_ip = online_ip
-        self.online_port = int(online_port)
-        self.auth_token = self._run_async(xAuThSTarTuP(
-            int(account_uid), token, int(timestamp), self.key, self.iv
-        ))
-        return True
-
-    def _connect_online(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((self.online_ip, self.online_port))
-        sock.send(bytes.fromhex(self.auth_token))
-        resp = sock.recv(4096)
-        if not resp:
-            sock.close()
-            return None
-        print(f"[+] {self.uid} Online connected")
-        return sock
-
-    def _reader(self, sock):
-        while self.running:
-            try:
-                data = sock.recv(4096)
-                if not data:
-                    break
-                # Optionally handle responses (not needed for spam)
-            except Exception as e:
-                print(f"[{self.uid}] Reader error: {e}")
-                break
-        self.running = False
-        self._need_reconnect = True
-
-    def _connect(self):
-        if not self._full_auth():
+        self.connected = False
+        self.need_reconnect = False
+        self.auth = AuthClient(uid, password)
+        
+        # Start connection
+        self.connect()
+    
+    def connect(self):
+        """Establish connection to game server"""
+        if self.connected:
+            return True
+        
+        # Authenticate
+        auth_result = self.auth.login()
+        if not auth_result:
             print(f"[-] {self.uid} Auth failed")
-            return
-        sock = self._connect_online()
-        if not sock:
-            return
-        self.online_sock = sock
-        self.running = True
-        self._need_reconnect = False
-        threading.Thread(target=self._reader, args=(sock,), daemon=True).start()
-        with connected_clients_lock:
-            connected_clients[self.uid] = self
-            print(f"Account {self.uid} online aa gaya. Total: {len(connected_clients)}")
-
-    def reconnect(self):
-        """Close old socket and reconnect."""
-        if self.online_sock:
+            return False
+        
+        # Store credentials
+        self.key = auth_result['encryption_key']
+        self.iv = auth_result['iv']
+        server_ip = auth_result['ip']
+        server_port = auth_result['port']
+        game_token = auth_result['game_token']
+        
+        # Connect to game server
+        try:
+            print(f"[{self.uid}] Connecting to {server_ip}:{server_port}...")
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(10)
+            self.sock.connect((server_ip, server_port))
+            
+            # Send auth token
+            token_bytes = game_token.encode()
+            token_length = struct.pack('>H', len(token_bytes))
+            self.sock.send(token_length + token_bytes)
+            
+            # Wait for response
+            response = self.sock.recv(1024)
+            if not response:
+                print(f"[-] {self.uid} No response from server")
+                self.sock.close()
+                return False
+            
+            # Parse response
+            resp_code = struct.unpack('>B', response[:1])[0]
+            if resp_code == 0:  # Success
+                self.connected = True
+                self.running = True
+                self.need_reconnect = False
+                
+                # Start reader thread
+                threading.Thread(target=self._reader, daemon=True).start()
+                
+                with connected_clients_lock:
+                    connected_clients[self.uid] = self
+                
+                print(f"✅ {self.uid} Connected! Total online: {len(connected_clients)}")
+                return True
+            else:
+                print(f"[-] {self.uid} Auth rejected by server (code: {resp_code})")
+                self.sock.close()
+                return False
+                
+        except socket.timeout:
+            print(f"[-] {self.uid} Connection timeout")
+            return False
+        except Exception as e:
+            print(f"[-] {self.uid} Connection error: {e}")
+            return False
+    
+    def _reader(self):
+        """Read responses from server"""
+        while self.running and self.connected:
             try:
-                self.online_sock.close()
+                self.sock.settimeout(1)
+                data = self.sock.recv(4096)
+                if not data:
+                    print(f"[{self.uid}] Server disconnected")
+                    break
+                # Process server messages if needed
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f"[{self.uid}] Reader error: {e}")
+                break
+        
+        self.connected = False
+        self.need_reconnect = True
+        self.running = False
+    
+    def send_packet(self, packet):
+        """Send encrypted packet to server"""
+        if not self.connected or not self.sock:
+            return False
+        
+        try:
+            # Add packet length header
+            packet_length = struct.pack('>I', len(packet))
+            self.sock.send(packet_length + packet)
+            return True
+        except Exception as e:
+            print(f"[{self.uid}] Send error: {e}")
+            self.need_reconnect = True
+            return False
+    
+    def join_room(self):
+        """Join game room"""
+        if not self.connected:
+            if not self.connect():
+                return False
+        
+        try:
+            # Build and encrypt room join packet
+            packet = build_join_room_packet()
+            encrypted = aes_encrypt(packet, self.key, self.iv)
+            
+            # Wrap with header
+            header = bytes.fromhex("0E15")
+            length = struct.pack('>H', len(encrypted))
+            
+            self.send_packet(header + length + encrypted)
+            time.sleep(0.5)
+            return True
+        except Exception as e:
+            print(f"[{self.uid}] Room join error: {e}")
+            return False
+    
+    def send_spam(self, target_uid):
+        """Send spam messages to target"""
+        if not self.connected:
+            if not self.connect():
+                return False
+        
+        try:
+            # Build and encrypt spam packet
+            packet = build_spam_packet(target_uid)
+            encrypted = aes_encrypt(packet, self.key, self.iv)
+            
+            # Wrap with header
+            header = bytes.fromhex("0E15")
+            length = struct.pack('>H', len(encrypted))
+            
+            self.send_packet(header + length + encrypted)
+            return True
+        except Exception as e:
+            print(f"[{self.uid}] Spam error: {e}")
+            return False
+    
+    def disconnect(self):
+        """Disconnect from server"""
+        self.running = False
+        self.connected = False
+        if self.sock:
+            try:
+                self.sock.close()
             except:
                 pass
-        self.running = False
-        self._connect()
+        self.sock = None
+    
+    def reconnect(self):
+        """Reconnect to server"""
+        self.disconnect()
+        time.sleep(2)
+        return self.connect()
 
-# ---------- Load accounts from Eren.txt ----------
-def load_accounts():
+# ================== GLOBAL STATE ==================
+connected_clients = {}
+connected_clients_lock = threading.Lock()
+active_spam_targets = {}
+active_spam_lock = threading.Lock()
+
+# ================== SPAM ENGINE ==================
+def spam_worker(target_id, duration_minutes=0):
+    """Worker thread for continuous spamming"""
+    print(f"\n🔥 Spam started on {target_id}")
+    if duration_minutes:
+        print(f"   Duration: {duration_minutes} minutes")
+    else:
+        print(f"   Duration: INFINITE (Yeh to maza aayega!)")
+    print("-" * 50)
+    
+    start_time = time.time()
+    spam_count = 0
+    
+    while True:
+        # Check if spam should stop
+        with active_spam_lock:
+            if target_id not in active_spam_targets:
+                print(f"\n🛑 Spam stopped for {target_id}")
+                break
+        
+        # Check duration
+        if duration_minutes > 0:
+            elapsed = time.time() - start_time
+            if elapsed >= duration_minutes * 60:
+                with active_spam_lock:
+                    if target_id in active_spam_targets:
+                        del active_spam_targets[target_id]
+                print(f"\n⏰ Duration complete for {target_id}")
+                break
+        
+        # Get all clients
+        with connected_clients_lock:
+            clients = list(connected_clients.values())
+        
+        if not clients:
+            print(f"[{target_id}] Koi bot online nahi hai! Wait kar rahe hain...")
+            time.sleep(5)
+            continue
+        
+        # Send spam from each client
+        for client in clients:
+            if not client.connected:
+                print(f"[{client.uid}] Reconnecting...")
+                client.reconnect()
+                if not client.connected:
+                    continue
+            
+            try:
+                # Join room first
+                client.send_packet(open_room_packet(client.key, client.iv))
+                time.sleep(0.3)
+                
+                # Send 10 spam packets
+                for i in range(10):
+                    spam_pkt = spam_message_packet(client.key, client.iv, target_id)
+                    client.send_packet(spam_pkt)
+                    spam_count += 1
+                    time.sleep(0.1)
+                
+                print(f"[{client.uid}] → {target_id}: 10 spam bhej diye (Total: {spam_count})")
+                
+            except Exception as e:
+                print(f"[{client.uid}] Error: {e}")
+                client.need_reconnect = True
+        
+        time.sleep(1)
+
+def send_spam_once(target_id):
+    """Send one round of spam from all clients"""
+    with connected_clients_lock:
+        clients = list(connected_clients.values())
+    
+    if not clients:
+        return False
+    
+    for client in clients:
+        if not client.connected:
+            client.reconnect()
+            if not client.connected:
+                continue
+        
+        try:
+            client.send_packet(open_room_packet(client.key, client.iv))
+            time.sleep(0.5)
+            
+            for _ in range(10):
+                spam_pkt = spam_message_packet(client.key, client.iv, target_id)
+                client.send_packet(spam_pkt)
+                time.sleep(0.1)
+                
+        except Exception as e:
+            print(f"[{client.uid}] Error: {e}")
+            client.need_reconnect = True
+    
+    return True
+
+# ================== ACCOUNT LOADER ==================
+def load_accounts(filename="Eren.txt"):
+    """Load accounts from file"""
     accounts = []
     try:
-        with open("Eren.txt", "r", encoding="utf-8") as f:
-            for line in f:
+        with open(filename, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
                 line = line.strip()
-                if line and ":" in line and not line.startswith("#"):
-                    uid, pwd = line.split(":", 1)
-                    accounts.append((uid, pwd))
+                # Skip comments and empty lines
+                if not line or line.startswith('#'):
+                    continue
+                # Parse uid:password
+                if ':' in line:
+                    parts = line.split(':', 1)
+                    uid = parts[0].strip()
+                    password = parts[1].strip()
+                    if uid and password:
+                        accounts.append((uid, password))
+        
+        print(f"✅ {len(accounts)} accounts loaded from {filename}")
+        return accounts
+        
     except FileNotFoundError:
-        print("Eren.txt nahi mili")
-    return accounts
+        print(f"❌ {filename} not found! Create it with format: uid:password")
+        print("   Example:")
+        print("   123456789:your_password")
+        print("   987654321:another_pass")
+        return []
+    except Exception as e:
+        print(f"❌ Error loading accounts: {e}")
+        return []
 
-def start_all_accounts():
-    for uid, pwd in load_accounts():
-        threading.Thread(target=lambda: FF_CLient(uid, pwd), daemon=True).start()
-        time.sleep(3)
+def start_all_clients():
+    """Start all game clients"""
+    accounts = load_accounts()
+    if not accounts:
+        print("❌ No accounts to start!")
+        return
+    
+    print(f"\n🚀 Starting {len(accounts)} accounts...")
+    print("=" * 50)
+    
+    for i, (uid, password) in enumerate(accounts, 1):
+        print(f"\n[{i}/{len(accounts)}] Starting: {uid}")
+        try:
+            client = GameClient(uid, password)
+            time.sleep(2)  # Delay to prevent rate limiting
+        except Exception as e:
+            print(f"❌ Failed to start {uid}: {e}")
+    
+    print("\n" + "=" * 50)
+    print(f"✅ Online bots: {len(connected_clients)}/{len(accounts)}")
+    if connected_clients:
+        print("📋 Connected UIDs:")
+        for uid in connected_clients:
+            print(f"   • {uid}")
 
-# ---------- Flask Web App (Hinglish, KUFA RAHAT) ----------
+# ================== FLASK WEB INTERFACE ==================
 app = Flask(__name__)
 
 HTML_TEMPLATE = '''
@@ -261,319 +698,391 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>KUFA RAHAT Spam Tool</title>
+    <title>🔥 KUFA RAHAT - Ultimate Spam Tool</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            color: #eee;
-            padding: 20px;
+            color: #fff;
             min-height: 100vh;
+            padding: 20px;
         }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
+        .container { max-width: 1400px; margin: 0 auto; }
         h1 {
             text-align: center;
+            font-size: 3rem;
             margin-bottom: 10px;
-            font-size: 2.5rem;
-            background: linear-gradient(90deg, #ff416c, #ff4b2b);
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+            background: linear-gradient(to right, #f7971e, #ffd200);
             -webkit-background-clip: text;
             background-clip: text;
             color: transparent;
         }
+        .subtitle {
+            text-align: center;
+            font-size: 1.2rem;
+            margin-bottom: 30px;
+            opacity: 0.9;
+        }
         .credit {
             text-align: center;
             margin-bottom: 30px;
-            font-size: 1rem;
-            opacity: 0.8;
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #ffd200;
+            text-shadow: 1px 1px 3px rgba(0,0,0,0.5);
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
         }
         .card {
-            background: rgba(255,255,255,0.1);
+            background: rgba(255, 255, 255, 0.1);
             backdrop-filter: blur(10px);
             border-radius: 20px;
             padding: 25px;
-            margin-bottom: 25px;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.2);
-            border: 1px solid rgba(255,255,255,0.2);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            transition: transform 0.3s;
+        }
+        .card:hover {
+            transform: translateY(-5px);
         }
         .card h2 {
-            margin-bottom: 20px;
             font-size: 1.5rem;
-            border-left: 4px solid #ff416c;
-            padding-left: 15px;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid rgba(255,255,255,0.3);
         }
-        .status-grid {
+        .stats {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            grid-template-columns: repeat(3, 1fr);
             gap: 15px;
             margin-bottom: 20px;
         }
-        .stat-card {
-            background: rgba(0,0,0,0.3);
-            border-radius: 15px;
+        .stat-box {
+            background: rgba(0, 0, 0, 0.3);
             padding: 15px;
+            border-radius: 10px;
             text-align: center;
         }
-        .stat-number {
+        .stat-value {
             font-size: 2rem;
             font-weight: bold;
-            color: #ff416c;
+            color: #ffd200;
         }
         .stat-label {
-            font-size: 0.9rem;
+            font-size: 0.8rem;
             opacity: 0.8;
+            margin-top: 5px;
         }
-        .account-list {
+        .bot-list {
             max-height: 200px;
             overflow-y: auto;
             background: rgba(0,0,0,0.2);
             border-radius: 10px;
             padding: 10px;
-            font-family: monospace;
+        }
+        .bot-item {
+            padding: 5px 10px;
+            margin: 3px 0;
+            background: rgba(255,255,255,0.05);
+            border-radius: 5px;
             font-size: 0.9rem;
         }
-        .account-item {
-            padding: 5px;
-            border-bottom: 1px solid rgba(255,255,255,0.1);
+        .bot-item.online { color: #00ff00; }
+        .bot-item.offline { color: #ff4444; }
+        .target-badge {
+            display: inline-block;
+            background: #ff6b6b;
+            padding: 5px 15px;
+            border-radius: 20px;
+            margin: 5px;
+            font-size: 0.9rem;
         }
         .form-group {
-            display: flex;
-            gap: 15px;
-            flex-wrap: wrap;
-            align-items: flex-end;
-        }
-        .input-field {
-            flex: 1;
-            min-width: 200px;
+            margin-bottom: 15px;
         }
         label {
             display: block;
             margin-bottom: 5px;
-            font-size: 0.8rem;
-            opacity: 0.8;
+            font-size: 0.9rem;
+            opacity: 0.9;
         }
-        input {
+        input, select {
             width: 100%;
-            padding: 12px 15px;
-            background: rgba(255,255,255,0.1);
-            border: 1px solid rgba(255,255,255,0.3);
+            padding: 12px;
+            border: 2px solid rgba(255,255,255,0.3);
             border-radius: 10px;
+            background: rgba(255,255,255,0.1);
             color: white;
             font-size: 1rem;
-            outline: none;
             transition: 0.3s;
         }
-        input:focus {
-            border-color: #ff416c;
-            box-shadow: 0 0 10px rgba(255,65,108,0.3);
+        input:focus, select:focus {
+            outline: none;
+            border-color: #ffd200;
+            box-shadow: 0 0 10px rgba(255,210,0,0.3);
         }
-        button {
-            padding: 12px 25px;
-            background: linear-gradient(90deg, #ff416c, #ff4b2b);
+        .btn {
+            width: 100%;
+            padding: 15px;
             border: none;
             border-radius: 10px;
-            color: white;
+            font-size: 1.1rem;
             font-weight: bold;
             cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
-            font-size: 1rem;
+            transition: all 0.3s;
+            text-transform: uppercase;
+            letter-spacing: 1px;
         }
-        button:hover {
+        .btn-start {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+        }
+        .btn-start:hover {
             transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(255,65,108,0.4);
+            box-shadow: 0 5px 20px rgba(240,147,251,0.4);
         }
-        .stop-btn {
-            background: linear-gradient(90deg, #4a4a4a, #2c2c2c);
+        .btn-stop {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
         }
-        .stop-btn:hover {
-            box-shadow: 0 5px 15px rgba(0,0,0,0.4);
+        .btn-stop:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(79,172,254,0.4);
+        }
+        .btn-refresh {
+            background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
+            color: white;
+            margin-top: 10px;
+        }
+        .btn-refresh:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(67,233,123,0.4);
         }
         .message {
-            margin-top: 15px;
+            margin-top: 10px;
             padding: 10px;
             border-radius: 10px;
             display: none;
         }
         .message.success {
-            background: rgba(0,255,0,0.2);
+            background: rgba(0, 255, 0, 0.2);
             border: 1px solid #00ff00;
             display: block;
         }
         .message.error {
-            background: rgba(255,0,0,0.2);
+            background: rgba(255, 0, 0, 0.2);
             border: 1px solid #ff0000;
             display: block;
         }
-        .active-targets {
-            margin-top: 15px;
-        }
-        .target-badge {
-            display: inline-block;
-            background: #ff416c;
-            padding: 5px 12px;
-            border-radius: 20px;
-            margin: 5px;
+        .spam-log {
+            background: rgba(0,0,0,0.5);
+            color: #00ff00;
+            padding: 15px;
+            border-radius: 10px;
+            font-family: 'Courier New', monospace;
             font-size: 0.8rem;
-        }
-        hr {
-            border-color: rgba(255,255,255,0.1);
-            margin: 15px 0;
+            max-height: 200px;
+            overflow-y: auto;
+            margin-top: 15px;
         }
         footer {
             text-align: center;
-            margin-top: 30px;
-            opacity: 0.6;
-            font-size: 0.8rem;
+            margin-top: 40px;
+            opacity: 0.7;
+            font-size: 0.9rem;
         }
+        .heart { color: #ff0000; }
     </style>
 </head>
 <body>
-<div class="container">
-    <h1>🔥 KUFA RAHAT Spam Tool 🔥</h1>
-    <div class="credit">⚡ Credit: KUFA RAHAT ⚡</div>
-
-    <!-- Status Card -->
-    <div class="card">
-        <h2>📊 Status</h2>
-        <div class="status-grid">
-            <div class="stat-card">
-                <div class="stat-number" id="accCount">0</div>
-                <div class="stat-label">Bot online aa gaye</div>
+    <div class="container">
+        <h1>🔥 KUFA RAHAT Spam Tool 🔥</h1>
+        <div class="credit">⚡ Powered by KUFA RAHAT ⚡</div>
+        
+        <!-- Stats -->
+        <div class="card">
+            <h2>📊 Live Statistics</h2>
+            <div class="stats">
+                <div class="stat-box">
+                    <div class="stat-value" id="totalBots">0</div>
+                    <div class="stat-label">Total Bots</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="onlineBots">0</div>
+                    <div class="stat-label">Online Bots</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="activeSpam">0</div>
+                    <div class="stat-label">Active Spam Targets</div>
+                </div>
             </div>
-            <div class="stat-card">
-                <div class="stat-number" id="activeSpamCount">0</div>
-                <div class="stat-label">Active spam chal raha</div>
+            
+            <h3>🤖 Bot List</h3>
+            <div class="bot-list" id="botList">Loading...</div>
+            
+            <button class="btn btn-refresh" onclick="refreshStatus()">🔄 Refresh Status</button>
+        </div>
+        
+        <div class="grid">
+            <!-- Start Spam -->
+            <div class="card">
+                <h2>🚀 Start Spam Attack</h2>
+                <div class="form-group">
+                    <label>Target UID:</label>
+                    <input type="text" id="targetUid" placeholder="Enter target UID (e.g., 15442063519)">
+                </div>
+                <div class="form-group">
+                    <label>Duration (minutes, 0 = infinite):</label>
+                    <input type="number" id="duration" value="0" min="0" placeholder="5">
+                </div>
+                <div class="form-group">
+                    <label>Intensity:</label>
+                    <select id="intensity">
+                        <option value="normal">Normal (10 msg/round)</option>
+                        <option value="medium" selected>Medium (50 msg/round)</option>
+                        <option value="high">High (100 msg/round)</option>
+                    </select>
+                </div>
+                <button class="btn btn-start" onclick="startSpam()">🔥 START SPAM ATTACK</button>
+                <div id="startMsg" class="message"></div>
+            </div>
+            
+            <!-- Stop Spam -->
+            <div class="card">
+                <h2>🛑 Stop Spam Attack</h2>
+                <div class="form-group">
+                    <label>Target UID to stop:</label>
+                    <input type="text" id="stopUid" placeholder="Enter UID to stop spamming">
+                </div>
+                <button class="btn btn-stop" onclick="stopSpam()">⏹ STOP SPAM</button>
+                <div id="stopMsg" class="message"></div>
+                
+                <div style="margin-top: 20px;">
+                    <h3>🎯 Active Targets</h3>
+                    <div id="activeTargets">No active spam targets</div>
+                </div>
             </div>
         </div>
-        <div>
-            <strong>📋 Connected bots:</strong>
-            <div class="account-list" id="accountList">
-                Loading...
-            </div>
+        
+        <!-- Quick Actions -->
+        <div class="card">
+            <h2>⚡ Quick Actions</h2>
+            <button class="btn btn-stop" onclick="stopAllSpam()" style="background: #ff0000;">
+                🛑 STOP ALL SPAM
+            </button>
         </div>
-        <div class="active-targets" id="activeTargetsDiv">
-            <strong>🎯 Jahan spam chal raha:</strong>
-            <div id="activeTargets"></div>
-        </div>
+        
+        <footer>
+            Made with <span class="heart">❤️</span> by KUFA RAHAT | 
+            Bot Army: <span id="footerBots">0</span> ready to attack!
+        </footer>
     </div>
-
-    <!-- Start Spam Card -->
-    <div class="card">
-        <h2>🚀 NEW SPAM UID</h2>
-        <div class="form-group">
-            <div class="input-field">
-                <label>Target ka uid daal</label>
-                <input type="text" id="targetUid" placeholder="Jaise 15442063519">
-            </div>
-            <div class="input-field">
-                <label>Kitne minute tak? (chhod do to infinite)</label>
-                <input type="number" id="duration" placeholder="Jaise 5">
-            </div>
-            <button id="startBtn">▶ Spsam start</button>
-        </div>
-        <div id="startMessage" class="message"></div>
-    </div>
-
-    <!-- Stop Spam Card -->
-    <div class="card">
-        <h2>🛑 SPAM OFF</h2>
-        <div class="form-group">
-            <div class="input-field">
-                <label>Jiska spam band karna hai uska uid daal</label>
-                <input type="text" id="stopTargetUid" placeholder="Jaise 15442063519">
-            </div>
-            <button id="stopBtn" class="stop-btn">⏹ SPAM OFF</button>
-        </div>
-        <div id="stopMessage" class="message"></div>
-    </div>
-
-    <footer>
-        ⚡ Har bot 10 packet bhejega per round, har minute round repeat hoga ⚡<br>
-        Made with ❤️ by KUFA RAHAT
-    </footer>
-</div>
-
-<script>
-    function fetchStatus() {
-        fetch('/api/status')
-            .then(res => res.json())
-            .then(data => {
-                document.getElementById('accCount').innerText = data.connected_accounts;
-                document.getElementById('activeSpamCount').innerText = data.active_spam.length;
-                const accListDiv = document.getElementById('accountList');
-                if (data.accounts && data.accounts.length) {
-                    accListDiv.innerHTML = data.accounts.map(acc => `<div class="account-item">📱 ${acc}</div>`).join('');
-                } else {
-                    accListDiv.innerHTML = '<div class="account-item">Koi bot online nahi</div>';
-                }
-                const targetsDiv = document.getElementById('activeTargets');
-                if (data.active_spam.length) {
-                    targetsDiv.innerHTML = data.active_spam.map(t => `<span class="target-badge">${t}</span>`).join('');
-                } else {
-                    targetsDiv.innerHTML = '<span style="opacity:0.7;">Koi active spam nahi</span>';
-                }
-            })
-            .catch(err => console.error(err));
-    }
-
-    function showMessage(elementId, text, isError = false) {
-        const el = document.getElementById(elementId);
-        el.innerText = text;
-        el.className = 'message ' + (isError ? 'error' : 'success');
-        setTimeout(() => {
-            el.className = 'message';
-        }, 3000);
-    }
-
-    document.getElementById('startBtn').onclick = () => {
-        const uid = document.getElementById('targetUid').value.trim();
-        const duration = document.getElementById('duration').value.trim();
-        if (!uid) {
-            showMessage('startMessage', 'Bhai uid to daal', true);
-            return;
+    
+    <script>
+        function refreshStatus() {
+            fetch('/api/status')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('totalBots').textContent = data.total_accounts;
+                    document.getElementById('onlineBots').textContent = data.online_bots;
+                    document.getElementById('activeSpam').textContent = data.active_spam.length;
+                    document.getElementById('footerBots').textContent = data.online_bots;
+                    
+                    // Bot list
+                    const botList = document.getElementById('botList');
+                    if (data.bots.length > 0) {
+                        botList.innerHTML = data.bots.map(bot => 
+                            `<div class="bot-item ${bot.online ? 'online' : 'offline'}">
+                                ${bot.online ? '🟢' : '🔴'} ${bot.uid}
+                            </div>`
+                        ).join('');
+                    } else {
+                        botList.innerHTML = '<div class="bot-item">No accounts loaded</div>';
+                    }
+                    
+                    // Active targets
+                    const activeTargets = document.getElementById('activeTargets');
+                    if (data.active_spam.length > 0) {
+                        activeTargets.innerHTML = data.active_spam.map(t => 
+                            `<span class="target-badge">🎯 ${t}</span>`
+                        ).join('');
+                    } else {
+                        activeTargets.innerHTML = 'No active spam targets';
+                    }
+                });
         }
-        const url = `/start_spam?uid=${encodeURIComponent(uid)}` + (duration ? `&duration=${parseInt(duration)}` : '');
-        fetch(url)
-            .then(res => res.json())
-            .then(data => {
-                if (data.error) {
-                    showMessage('startMessage', data.error, true);
-                } else {
-                    showMessage('startMessage', `✅ ${data.status} | Target: ${data.target} | Duration: ${data.duration_minutes || 'Infinite'} min`);
-                    document.getElementById('targetUid').value = '';
-                    document.getElementById('duration').value = '';
-                    fetchStatus();
-                }
-            })
-            .catch(err => showMessage('startMessage', 'Server error', true));
-    };
-
-    document.getElementById('stopBtn').onclick = () => {
-        const uid = document.getElementById('stopTargetUid').value.trim();
-        if (!uid) {
-            showMessage('stopMessage', 'Bhai uid daal jiska spam band karna hai', true);
-            return;
+        
+        function showMsg(id, text, isError) {
+            const el = document.getElementById(id);
+            el.textContent = text;
+            el.className = `message ${isError ? 'error' : 'success'}`;
+            setTimeout(() => el.className = 'message', 5000);
         }
-        fetch(`/stop_spam?uid=${encodeURIComponent(uid)}`)
-            .then(res => res.json())
-            .then(data => {
-                if (data.error) {
-                    showMessage('stopMessage', data.error, true);
-                } else {
-                    showMessage('stopMessage', `🛑 ${data.status}`);
-                    document.getElementById('stopTargetUid').value = '';
-                    fetchStatus();
-                }
-            })
-            .catch(err => showMessage('stopMessage', 'Server error', true));
-    };
-
-    fetchStatus();
-    setInterval(fetchStatus, 3000);
-</script>
+        
+        function startSpam() {
+            const uid = document.getElementById('targetUid').value.trim();
+            const duration = document.getElementById('duration').value;
+            const intensity = document.getElementById('intensity').value;
+            
+            if (!uid) {
+                showMsg('startMsg', '❌ Please enter a target UID!', true);
+                return;
+            }
+            
+            fetch(`/api/start_spam?uid=${uid}&duration=${duration}&intensity=${intensity}`)
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) {
+                        showMsg('startMsg', '❌ ' + data.error, true);
+                    } else {
+                        showMsg('startMsg', '✅ ' + data.message, false);
+                        document.getElementById('targetUid').value = '';
+                        refreshStatus();
+                    }
+                });
+        }
+        
+        function stopSpam() {
+            const uid = document.getElementById('stopUid').value.trim();
+            if (!uid) {
+                showMsg('stopMsg', '❌ Please enter a UID!', true);
+                return;
+            }
+            
+            fetch(`/api/stop_spam?uid=${uid}`)
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) {
+                        showMsg('stopMsg', '❌ ' + data.error, true);
+                    } else {
+                        showMsg('stopMsg', '✅ ' + data.message, false);
+                        document.getElementById('stopUid').value = '';
+                        refreshStatus();
+                    }
+                });
+        }
+        
+        function stopAllSpam() {
+            if (confirm('Are you sure you want to stop ALL spam attacks?')) {
+                fetch('/api/stop_all_spam')
+                    .then(r => r.json())
+                    .then(data => {
+                        alert(data.message);
+                        refreshStatus();
+                    });
+            }
+        }
+        
+        // Auto-refresh every 3 seconds
+        refreshStatus();
+        setInterval(refreshStatus, 3000);
+    </script>
 </body>
 </html>
 '''
@@ -584,48 +1093,137 @@ def index():
 
 @app.route('/api/status')
 def api_status():
-    with active_spam_lock:
-        active = list(active_spam_targets.keys())
+    """Get current status of all bots and spam"""
     with connected_clients_lock:
-        acc_list = list(connected_clients.keys())
+        bots = []
+        for uid, client in connected_clients.items():
+            bots.append({
+                'uid': uid,
+                'online': client.connected
+            })
+    
+    with active_spam_lock:
+        active_targets = list(active_spam_targets.keys())
+    
     return jsonify({
-        'connected_accounts': len(connected_clients),
-        'accounts': acc_list,
-        'active_spam': active
+        'total_accounts': len(load_accounts()),
+        'online_bots': len([b for b in bots if b['online']]),
+        'bots': bots,
+        'active_spam': active_targets
     })
 
-@app.route('/start_spam')
-def start_spam_route():
-    target = request.args.get('uid')
-    duration = request.args.get('duration', type=int)
-    if not target:
-        return jsonify({'error': 'uid parameter chahiye'}), 400
+@app.route('/api/start_spam')
+def start_spam():
+    """Start spam on a target"""
+    target_uid = request.args.get('uid')
+    duration = request.args.get('duration', 0, type=int)
+    intensity = request.args.get('intensity', 'normal')
+    
+    if not target_uid:
+        return jsonify({'error': 'Target UID is required'}), 400
+    
     if not connected_clients:
-        return jsonify({'error': 'Koi bot online nahi hai'}), 500
+        return jsonify({'error': 'No bots online! Please wait for bots to connect.'}), 400
+    
     with active_spam_lock:
-        if target in active_spam_targets:
-            return jsonify({'error': f'{target} pe already spam chal raha hai'}), 409
-        active_spam_targets[target] = True
-        threading.Thread(target=spam_worker, args=(target, duration), daemon=True).start()
+        if target_uid in active_spam_targets:
+            return jsonify({'error': f'Already spamming {target_uid}'}), 409
+        active_spam_targets[target_uid] = True
+    
+    # Start spam in background thread
+    threading.Thread(
+        target=spam_worker,
+        args=(target_uid, duration),
+        daemon=True
+    ).start()
+    
     return jsonify({
-        'status': 'Spam shuru kar diya',
-        'target': target,
-        'duration_minutes': duration
+        'message': f'🔥 Spam started on {target_uid}! Duration: {"infinite" if duration == 0 else str(duration) + " minutes"}',
+        'target': target_uid,
+        'duration': duration,
+        'intensity': intensity,
+        'bots_attacking': len(connected_clients)
     })
 
-@app.route('/stop_spam')
-def stop_spam_route():
-    target = request.args.get('uid')
-    if not target:
-        return jsonify({'error': 'uid parameter chahiye'}), 400
+@app.route('/api/stop_spam')
+def stop_spam():
+    """Stop spam on a target"""
+    target_uid = request.args.get('uid')
+    
+    if not target_uid:
+        return jsonify({'error': 'Target UID is required'}), 400
+    
     with active_spam_lock:
-        if target in active_spam_targets:
-            del active_spam_targets[target]
-            return jsonify({'status': f'{target} ka spam band kar diya'})
+        if target_uid in active_spam_targets:
+            del active_spam_targets[target_uid]
+            return jsonify({'message': f'✅ Spam stopped for {target_uid}'})
         else:
-            return jsonify({'error': f'{target} pe koi spam nahi chal raha'}), 404
+            return jsonify({'error': f'{target_uid} is not being spammed'}), 404
 
-# ---------- Main ----------
-if __name__ == '__main__':
-    threading.Thread(target=start_all_accounts, daemon=True).start()
+@app.route('/api/stop_all_spam')
+def stop_all_spam():
+    """Stop all active spam"""
+    with active_spam_lock:
+        count = len(active_spam_targets)
+        active_spam_targets.clear()
+    
+    return jsonify({'message': f'✅ Stopped all spam attacks! ({count} targets)'})
+
+# ================== MAIN ==================
+def main():
+    print("""
+    ╔══════════════════════════════════════════════════════════╗
+    ║                                                          ║
+    ║        🔥 KUFA RAHAT - ULTIMATE SPAM TOOL 🔥            ║
+    ║                                                          ║
+    ║        Created by: KUFA RAHAT                            ║
+    ║        Version: 3.0                                      ║
+    ║        Type: Complete A-Z Solution                       ║
+    ║                                                          ║
+    ╚══════════════════════════════════════════════════════════╝
+    """)
+    
+    print("📋 Checking for accounts file (Eren.txt)...")
+    accounts = load_accounts()
+    
+    if not accounts:
+        print("\n❌ No accounts found!")
+        print("Please create 'Eren.txt' file with format:")
+        print("uid1:password1")
+        print("uid2:password2")
+        print("\nExample:")
+        print("123456789:mypassword123")
+        print("987654321:anotherpass456")
+        
+        # Create sample file
+        with open('Eren.txt', 'w') as f:
+            f.write("# Add your accounts below\n")
+            f.write("# Format: uid:password\n")
+            f.write("# Example: 123456789:mypassword\n\n")
+        
+        print("\n✅ Sample 'Eren.txt' created. Add your accounts and restart!")
+        input("\nPress Enter to exit...")
+        return
+    
+    print(f"\n🚀 Starting {len(accounts)} bot accounts...")
+    
+    # Start all accounts in background
+    threading.Thread(target=start_all_clients, daemon=True).start()
+    
+    # Wait for some bots to connect
+    print("\n⏳ Waiting for bots to connect (10 seconds)...")
+    time.sleep(10)
+    
+    print(f"\n✅ {len(connected_clients)} bots connected!")
+    print("\n🌐 Starting web interface...")
+    print("=" * 50)
+    print("📍 Access the web interface:")
+    print("   http://localhost:5000")
+    print("   http://127.0.0.1:5000")
+    print("=" * 50)
+    
+    # Start Flask web server
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+
+if __name__ == '__main__':
+    main()
